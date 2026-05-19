@@ -26,3 +26,21 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --emb_skip_threshold 1000000 \
 #     --num_workers 8 \
 #     "$@"
+
+# ---- Experimental: Sparse MoE in RankMixerBlock ----
+# Replaces shared per-token FFN with sparse top-k MoE (router + N experts).
+# Adds --moe_aux_loss_weight to the main loss for load balancing.
+#
+# python3 -u "${SCRIPT_DIR}/train.py" \
+#     --ns_tokenizer_type rankmixer \
+#     --user_ns_tokens 5 \
+#     --item_ns_tokens 2 \
+#     --num_queries 2 \
+#     --ns_groups_json "" \
+#     --rank_mixer_mode moe \
+#     --moe_num_experts 4 \
+#     --moe_top_k 2 \
+#     --moe_aux_loss_weight 0.01 \
+#     --emb_skip_threshold 1000000 \
+#     --num_workers 8 \
+#     "$@"

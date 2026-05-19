@@ -58,6 +58,7 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        moe_aux_loss_weight: float = 0.0,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -107,10 +108,48 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.moe_aux_loss_weight: float = moe_aux_loss_weight
+
+        # Log label==1 vs label==0 once from real batches (Parquet: label_type==2 -> 1).
+        self._logged_valid_label_distribution: bool = False
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+
+    @staticmethod
+    def _binary_label_counts(y: torch.Tensor) -> Tuple[int, int, int]:
+        """Return (n_positive, n_negative, n_other) for long/binary labels."""
+        flat = y.long().view(-1)
+        n_pos = int((flat == 1).sum().item())
+        n_neg = int((flat == 0).sum().item())
+        n_other = int(flat.numel()) - n_pos - n_neg
+        return n_pos, n_neg, n_other
+
+    def _log_label_distribution(
+        self,
+        split: str,
+        n_pos: int,
+        n_neg: int,
+        n_other: int,
+        note: str = "",
+    ) -> None:
+        total = n_pos + n_neg + n_other
+        if total <= 0:
+            logging.info(f"Label distribution [{split}]: empty batch (no rows).")
+            return
+        pos_rate = n_pos / total
+        suffix = f" {note}" if note else ""
+        if n_other > 0:
+            logging.warning(
+                f"Label distribution [{split}]: positive={n_pos:,}, negative={n_neg:,}, "
+                f"other_values={n_other:,}, pos_rate={pos_rate:.6f}, total={total:,}.{suffix}"
+            )
+        else:
+            logging.info(
+                f"Label distribution [{split}]: positive={n_pos:,}, negative={n_neg:,}, "
+                f"pos_rate={pos_rate:.6f}, total={total:,}.{suffix}"
+            )
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -296,11 +335,18 @@ class PCVRHyFormerRankingTrainer:
         total_step = 0
 
         for epoch in range(1, self.num_epochs + 1):
+            train_pos = train_neg = train_oth = 0
             train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                               dynamic_ncols=True)
             loss_sum = 0.0
 
             for step, batch in train_pbar:
+                if epoch == 1:
+                    p, n, o = self._binary_label_counts(batch['label'])
+                    train_pos += p
+                    train_neg += n
+                    train_oth += o
+
                 loss = self._train_step(batch)
                 total_step += 1
                 loss_sum += loss
@@ -326,8 +372,25 @@ class PCVRHyFormerRankingTrainer:
                     self._handle_validation_result(total_step, val_auc, val_logloss)
 
                     if self.early_stopping.early_stop:
+                        if epoch == 1 and (train_pos + train_neg + train_oth) > 0:
+                            self._log_label_distribution(
+                                "train",
+                                train_pos,
+                                train_neg,
+                                train_oth,
+                                note="partial epoch 1 (early stop mid-epoch)",
+                            )
                         logging.info(f"Early stopping at step {total_step}")
                         return
+
+            if epoch == 1 and (train_pos + train_neg + train_oth) > 0:
+                self._log_label_distribution(
+                    "train",
+                    train_pos,
+                    train_neg,
+                    train_oth,
+                    note="epoch 1 full pass over train_loader (label_type==2 -> 1)",
+                )
 
             logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / len(self.train_loader)}")
 
@@ -416,6 +479,8 @@ class PCVRHyFormerRankingTrainer:
             loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
         else:
             loss = F.binary_cross_entropy_with_logits(logits, label)
+        if self.moe_aux_loss_weight > 0 and hasattr(self.model, 'get_aux_loss'):
+            loss = loss + self.moe_aux_loss_weight * self.model.get_aux_loss()
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
@@ -451,6 +516,17 @@ class PCVRHyFormerRankingTrainer:
 
         all_logits = torch.cat(all_logits_list, dim=0)
         all_labels = torch.cat(all_labels_list, dim=0).long()
+
+        if not self._logged_valid_label_distribution:
+            vp, vn, vo = self._binary_label_counts(all_labels)
+            self._log_label_distribution(
+                "valid",
+                vp,
+                vn,
+                vo,
+                note="first full pass over valid_loader (same label rule as train)",
+            )
+            self._logged_valid_label_distribution = True
 
         # Binary AUC via sklearn.
         probs = torch.sigmoid(all_logits).numpy()

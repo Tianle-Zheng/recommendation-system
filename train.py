@@ -124,11 +124,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
-                        choices=['full', 'ffn_only', 'none'],
+                        choices=['full', 'ffn_only', 'none', 'moe'],
                         help='RankMixerBlock mode: '
                              'full = token mixing + per-token FFN (requires d_model divisible by T), '
                              'ffn_only = per-token FFN only, '
-                             'none = identity passthrough')
+                             'none = identity passthrough, '
+                             'moe = token mixing + sparse top-k MoE FFN')
+    parser.add_argument('--moe_num_experts', type=int, default=4,
+                        help='Number of expert FFNs (used only when --rank_mixer_mode=moe)')
+    parser.add_argument('--moe_top_k', type=int, default=2,
+                        help='Top-k experts activated per token (used only when --rank_mixer_mode=moe)')
+    parser.add_argument('--moe_aux_loss_weight', type=float, default=0.01,
+                        help='Coefficient for MoE load-balancing auxiliary loss')
     parser.add_argument('--use_rope', action='store_true', default=False,
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
@@ -251,6 +258,7 @@ def main() -> None:
         seq_max_lens=seq_max_lens,
     )
 
+
     # ---- NS groups ----
     if args.ns_groups_json and os.path.exists(args.ns_groups_json):
         logging.info(f"Loading NS groups from {args.ns_groups_json}")
@@ -301,6 +309,8 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "moe_num_experts": args.moe_num_experts,
+        "moe_top_k": args.moe_top_k,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -350,6 +360,7 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        moe_aux_loss_weight=args.moe_aux_loss_weight,
     )
 
     trainer.train()

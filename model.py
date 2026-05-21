@@ -412,13 +412,57 @@ class RankMixerBlock(nn.Module):
         return Q_boost
 
 
+class DINPooler(nn.Module):
+    """DIN-style target-aware sequence pooling.
+
+    For each sequence position, scores its relevance to a target item via
+    an MLP over [item, seq_pos, item-seq_pos, item*seq_pos], then takes a
+    softmax-weighted sum of the sequence tokens. Replaces mean pool when
+    enabled.
+    """
+
+    def __init__(self, d_model: int, hidden_mult: int = 2) -> None:
+        super().__init__()
+        self.score_mlp = nn.Sequential(
+            nn.Linear(d_model * 4, d_model * hidden_mult),
+            nn.GELU(),
+            nn.Linear(d_model * hidden_mult, 1),
+        )
+
+    def forward(
+        self,
+        item_query: torch.Tensor,        # (B, D)
+        seq_tokens: torch.Tensor,        # (B, L, D)
+        seq_padding_mask: torch.Tensor,  # (B, L), True = padding
+    ) -> torch.Tensor:
+        B, L, D = seq_tokens.shape
+        item_exp = item_query.unsqueeze(1).expand(-1, L, -1)  # (B, L, D)
+        interaction = torch.cat([
+            item_exp,
+            seq_tokens,
+            item_exp - seq_tokens,
+            item_exp * seq_tokens,
+        ], dim=-1)                                            # (B, L, 4D)
+        score = self.score_mlp(interaction).squeeze(-1)       # (B, L)
+        score = score.masked_fill(seq_padding_mask, float('-inf'))
+        weights = F.softmax(score, dim=1)
+        # All-padded rows produce NaN softmax; zero them out (residual zero contribution)
+        weights = torch.nan_to_num(weights, nan=0.0)
+        pooled = (weights.unsqueeze(-1) * seq_tokens).sum(dim=1)  # (B, D)
+        return pooled
+
+
 class MultiSeqQueryGenerator(nn.Module):
     """Multi-sequence query generation module.
 
     Generates Q tokens independently for each sequence:
     For each sequence i:
-        GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
+        GlobalInfo_i = Concat(F1..FM, Pool(Seq_i))
         Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
+
+    Pool is mean pool by default; if ``use_din_pool=True`` and an
+    ``item_query`` is supplied at forward time, DINPooler replaces the
+    mean pool with item-aware soft attention.
     """
 
     def __init__(
@@ -427,12 +471,14 @@ class MultiSeqQueryGenerator(nn.Module):
         num_ns: int,
         num_queries: int,
         num_sequences: int,
-        hidden_mult: int = 4
+        hidden_mult: int = 4,
+        use_din_pool: bool = False,
     ) -> None:
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.d_model = d_model
+        self.use_din_pool = use_din_pool
 
         global_info_dim = (num_ns + 1) * d_model
 
@@ -453,11 +499,17 @@ class MultiSeqQueryGenerator(nn.Module):
             for _ in range(num_sequences)
         ])
 
+        if use_din_pool:
+            self.din_poolers = nn.ModuleList([
+                DINPooler(d_model) for _ in range(num_sequences)
+            ])
+
     def forward(
         self,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
-        seq_padding_masks: list
+        seq_padding_masks: list,
+        item_query: Optional[torch.Tensor] = None,
     ) -> list:
         """Generates query tokens for each sequence.
 
@@ -466,6 +518,8 @@ class MultiSeqQueryGenerator(nn.Module):
             seq_tokens_list: List of (B, L_i, D) tensors, length S.
             seq_padding_masks: List of (B, L_i) masks, length S. True
                 indicates padding.
+            item_query: Optional (B, D) target-item representation. Required
+                when ``use_din_pool=True``.
 
         Returns:
             List of (B, Nq, D) query token tensors, length S.
@@ -475,12 +529,16 @@ class MultiSeqQueryGenerator(nn.Module):
 
         q_tokens_list = []
         for i in range(self.num_sequences):
-            # MeanPool(Seq_i)
-            valid_mask = ~seq_padding_masks[i]  # True = valid
-            valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L_i, 1)
-            seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
-            seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
-            seq_pooled = seq_sum / seq_count  # (B, D)
+            if self.use_din_pool and item_query is not None:
+                seq_pooled = self.din_poolers[i](
+                    item_query, seq_tokens_list[i], seq_padding_masks[i]
+                )
+            else:
+                valid_mask = ~seq_padding_masks[i]
+                valid_mask_expanded = valid_mask.unsqueeze(-1).float()
+                seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)
+                seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)
+                seq_pooled = seq_sum / seq_count
 
             # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)
             global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
@@ -1229,6 +1287,8 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # DIN-style target-aware sequence pooling
+        use_din_pool: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1304,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_din_pool = use_din_pool
 
         # ================== NS Tokens Construction ==================
 
@@ -1385,6 +1446,7 @@ class PCVRHyFormer(nn.Module):
             num_queries=num_queries,
             num_sequences=self.num_sequences,
             hidden_mult=hidden_mult,
+            use_din_pool=use_din_pool,
         )
 
         # MultiSeqHyFormerBlock stack
@@ -1642,11 +1704,14 @@ class PCVRHyFormer(nn.Module):
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
+        item_tokens_for_query = [item_ns]
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
+            item_tokens_for_query.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        item_query = torch.cat(item_tokens_for_query, dim=1).mean(dim=1) if self.use_din_pool else None
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1662,7 +1727,8 @@ class PCVRHyFormer(nn.Module):
             seq_masks_list.append(mask)
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        q_tokens_list = self.query_generator(
+            ns_tokens, seq_tokens_list, seq_masks_list, item_query=item_query)
 
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
@@ -1685,11 +1751,14 @@ class PCVRHyFormer(nn.Module):
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
+        item_tokens_for_query = [item_ns]
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
+            item_tokens_for_query.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
+        item_query = torch.cat(item_tokens_for_query, dim=1).mean(dim=1) if self.use_din_pool else None
 
         seq_tokens_list = []
         seq_masks_list = []
@@ -1703,7 +1772,8 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        q_tokens_list = self.query_generator(
+            ns_tokens, seq_tokens_list, seq_masks_list, item_query=item_query)
 
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,

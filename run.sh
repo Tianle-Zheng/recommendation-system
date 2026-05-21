@@ -26,3 +26,18 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --emb_skip_threshold 1000000 \
 #     --num_workers 8 \
 #     "$@"
+
+# ---- Experimental: DIN-style target-aware sequence pooling ----
+# Replaces mean pool in MultiSeqQueryGenerator with attention pool weighted
+# by item embedding. One Linear+GELU+Linear MLP per sequence; small overhead.
+#
+# python3 -u "${SCRIPT_DIR}/train.py" \
+#     --ns_tokenizer_type rankmixer \
+#     --user_ns_tokens 5 \
+#     --item_ns_tokens 2 \
+#     --num_queries 2 \
+#     --ns_groups_json "" \
+#     --use_din_pool \
+#     --emb_skip_threshold 1000000 \
+#     --num_workers 8 \
+#     "$@"

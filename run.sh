@@ -47,8 +47,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #   T = (num_queries + din_top_k) * num_sequences + num_ns
 #     = (2 + 12) * 4 + (5+1+2+0) = 64    ✓ 128 % 64 == 0
 # top_k=12 per sequence × 4 ≈ 48 total ~ LONGER paper's "50 sampled queries"
-# sweet spot. MoE replaces shared FFN with sparse top-2 of 4 experts
-# (params 4x, compute ~2x baseline FFN). Comment everything above and
+# sweet spot. MoE replaces shared FFN with sparse top-2 of 16 experts
+# (params 16x, compute ~2x baseline FFN). Comment everything above and
 # uncomment this to run.
 #
 # python3 -u "${SCRIPT_DIR}/train.py" \

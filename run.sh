@@ -43,13 +43,14 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     "$@"
 
 # ---- Experimental: DIN + LONGER token merge + extended sequence length ----
-# Full-stack long-history setup:
-#   - seq_max_lens raised to 1024 for seq_b/seq_d (so users with 1000+ history
-#     are no longer truncated).
-#   - LONGER token merge (size=4, with inner Transformer) compresses each
-#     loaded sequence back to ~256 before downstream attention, so memory
-#     and FLOPs match the 256-baseline.
+# Full-stack long-history setup matched to LONGER paper's optimal K=8 ratio:
+#   - seq_max_lens=1000 for all four domains (data is ~1000 latest-first).
+#   - LONGER token merge (size=8, with inner Transformer) compresses each
+#     loaded sequence to 125 tokens before downstream attention.
+#     Inner-window self-attn has 8x8=64 scores, giving the InnerTransformer
+#     meaningful structure to learn within each merge window.
 #   - DIN pool over merged tokens does target-aware aggregation.
+#   - RoPE enabled so sequence encoder can exploit recency ordering.
 #
 # python3 -u "${SCRIPT_DIR}/train.py" \
 #     --ns_tokenizer_type rankmixer \
@@ -57,10 +58,11 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --item_ns_tokens 2 \
 #     --num_queries 2 \
 #     --ns_groups_json "" \
-#     --seq_max_lens "seq_a:512,seq_b:1024,seq_c:512,seq_d:1024" \
-#     --merge_size 4 \
+#     --seq_max_lens "seq_a:1000,seq_b:1000,seq_c:1000,seq_d:1000" \
+#     --merge_size 8 \
 #     --merge_num_heads 2 \
 #     --use_din_pool \
+#     --use_rope \
 #     --emb_skip_threshold 1000000 \
 #     --num_workers 8 \
 #     "$@"

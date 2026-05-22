@@ -62,6 +62,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --merge_size 8 \
 #     --merge_num_heads 2 \
 #     --use_din_pool \
+#     --din_pos_dim 0 \
 #     --use_rope \
 #     --emb_skip_threshold 1000000 \
 #     --num_workers 8 \

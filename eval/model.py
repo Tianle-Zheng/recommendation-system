@@ -549,10 +549,20 @@ class DINPooler(nn.Module):
     softmax-weighted sum of the sequence tokens.
     """
 
-    def __init__(self, d_model: int, hidden_mult: int = 2) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        hidden_mult: int = 2,
+        pos_dim: int = 0,
+        max_len: int = 1024,
+    ) -> None:
         super().__init__()
+        self.pos_dim = pos_dim
+        if pos_dim > 0:
+            self.pos_emb = nn.Embedding(max_len, pos_dim)
+        in_dim = d_model * 4 + pos_dim
         self.score_mlp = nn.Sequential(
-            nn.Linear(d_model * 4, d_model * hidden_mult),
+            nn.Linear(in_dim, d_model * hidden_mult),
             nn.GELU(),
             nn.Linear(d_model * hidden_mult, 1),
         )
@@ -565,12 +575,17 @@ class DINPooler(nn.Module):
     ) -> torch.Tensor:
         B, L, D = seq_tokens.shape
         item_exp = item_query.unsqueeze(1).expand(-1, L, -1)
-        interaction = torch.cat([
+        parts = [
             item_exp,
             seq_tokens,
             item_exp - seq_tokens,
             item_exp * seq_tokens,
-        ], dim=-1)
+        ]
+        if self.pos_dim > 0:
+            positions = torch.arange(L, device=seq_tokens.device)
+            pos_feat = self.pos_emb(positions).unsqueeze(0).expand(B, -1, -1)
+            parts.append(pos_feat)
+        interaction = torch.cat(parts, dim=-1)
         score = self.score_mlp(interaction).squeeze(-1)
         score = score.masked_fill(seq_padding_mask, float('-inf'))
         weights = F.softmax(score, dim=1)
@@ -599,6 +614,8 @@ class MultiSeqQueryGenerator(nn.Module):
         num_sequences: int,
         hidden_mult: int = 4,
         use_din_pool: bool = False,
+        din_pos_dim: int = 0,
+        din_max_len: int = 1024,
     ) -> None:
         super().__init__()
         self.num_queries = num_queries
@@ -627,7 +644,8 @@ class MultiSeqQueryGenerator(nn.Module):
 
         if use_din_pool:
             self.din_poolers = nn.ModuleList([
-                DINPooler(d_model) for _ in range(num_sequences)
+                DINPooler(d_model, pos_dim=din_pos_dim, max_len=din_max_len)
+                for _ in range(num_sequences)
             ])
 
     def forward(
@@ -1452,6 +1470,8 @@ class PCVRHyFormer(nn.Module):
         moe_top_k: int = 2,
         # DIN-style target-aware sequence pooling
         use_din_pool: bool = False,
+        din_pos_dim: int = 0,
+        din_max_len: int = 1024,
         # LONGER-style token merge (1 = disabled)
         merge_size: int = 1,
         merge_num_heads: int = 2,
@@ -1635,6 +1655,8 @@ class PCVRHyFormer(nn.Module):
             num_sequences=self.num_sequences,
             hidden_mult=hidden_mult,
             use_din_pool=use_din_pool,
+            din_pos_dim=din_pos_dim,
+            din_max_len=din_max_len,
         )
 
         # MultiSeqHyFormerBlock stack

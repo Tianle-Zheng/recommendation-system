@@ -132,6 +132,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--use_din_pool', action='store_true', default=False,
                         help='Replace mean pool in MultiSeqQueryGenerator with DIN-style '
                              'target-aware attention pool (uses item embedding as query)')
+    parser.add_argument('--din_pos_dim', type=int, default=0,
+                        help='Position embedding dim concatenated into DIN score MLP input. '
+                             '0 = auto (d_model // 4: 16 for d=64, 32 for d=128). '
+                             '-1 = disabled. >0 = explicit dim. '
+                             'Lets DIN exploit latest-first sequence ordering for recency bias.')
+    parser.add_argument('--din_max_len', type=int, default=1024,
+                        help='Max sequence length supported by DIN position embedding')
     parser.add_argument('--merge_size', type=int, default=1,
                         help='LONGER-style token merge factor per domain (1 = disabled). '
                              'Merges every k adjacent tokens via an inner Transformer + '
@@ -313,6 +320,10 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "use_din_pool": args.use_din_pool,
+        # din_pos_dim: 0 = auto (d_model // 4); -1 = disabled; >0 = explicit
+        "din_pos_dim": (args.d_model // 4) if args.din_pos_dim == 0
+                       else (0 if args.din_pos_dim < 0 else args.din_pos_dim),
+        "din_max_len": args.din_max_len,
         "merge_size": args.merge_size,
         "merge_num_heads": args.merge_num_heads,
     }

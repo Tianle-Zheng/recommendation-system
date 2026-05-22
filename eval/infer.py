@@ -71,6 +71,8 @@ _FALLBACK_MODEL_CFG = {
     'moe_num_experts': 4,
     'moe_top_k': 2,
     'use_din_pool': False,
+    'din_pos_dim': 0,
+    'din_max_len': 1024,
     'merge_size': 1,
     'merge_num_heads': 2,
 }

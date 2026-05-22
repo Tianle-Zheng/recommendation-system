@@ -73,6 +73,7 @@ _FALLBACK_MODEL_CFG = {
     'use_din_pool': False,
     'din_pos_dim': 0,
     'din_max_len': 1024,
+    'din_top_k': 0,
     'merge_size': 1,
     'merge_num_heads': 2,
 }

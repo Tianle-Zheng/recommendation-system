@@ -139,6 +139,13 @@ def parse_args() -> argparse.Namespace:
                              'Lets DIN exploit latest-first sequence ordering for recency bias.')
     parser.add_argument('--din_max_len', type=int, default=1024,
                         help='Max sequence length supported by DIN position embedding')
+    parser.add_argument('--din_top_k', type=int, default=0,
+                        help='DIN top-K: the K most-relevant sequence positions per '
+                             'domain (by DIN score) become additional Q tokens that '
+                             'participate in cross-attention and token mixing alongside '
+                             'the FFN-generated num_queries. 0 = disabled. '
+                             'Effective T = (num_queries + din_top_k) * num_sequences + num_ns '
+                             '— must still divide d_model. Only meaningful with --use_din_pool.')
     parser.add_argument('--merge_size', type=int, default=1,
                         help='LONGER-style token merge factor per domain (1 = disabled). '
                              'Merges every k adjacent tokens via an inner Transformer + '
@@ -324,6 +331,7 @@ def main() -> None:
         "din_pos_dim": (args.d_model // 4) if args.din_pos_dim == 0
                        else (0 if args.din_pos_dim < 0 else args.din_pos_dim),
         "din_max_len": args.din_max_len,
+        "din_top_k": args.din_top_k,
         "merge_size": args.merge_size,
         "merge_num_heads": args.merge_num_heads,
     }

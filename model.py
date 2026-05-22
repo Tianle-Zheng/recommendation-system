@@ -587,7 +587,16 @@ class DINPooler(nn.Module):
         item_query: torch.Tensor,        # (B, D)
         seq_tokens: torch.Tensor,        # (B, L, D)
         seq_padding_mask: torch.Tensor,  # (B, L), True = padding
-    ) -> torch.Tensor:
+        top_k: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Returns (pooled, top_k_tokens).
+
+        pooled: (B, D) standard softmax-weighted aggregation, feeds GlobalInfo.
+        top_k_tokens: (B, top_k, D) if top_k > 0, else None. The top-k seq
+            positions by score; intended to be appended to Q tokens as extra
+            queries for cross-attention with the sequence. Fully-padded rows
+            yield zeros for missing positions.
+        """
         B, L, D = seq_tokens.shape
         item_exp = item_query.unsqueeze(1).expand(-1, L, -1)  # (B, L, D)
         parts = [
@@ -607,7 +616,22 @@ class DINPooler(nn.Module):
         # All-padded rows produce NaN softmax; zero them out (residual zero contribution)
         weights = torch.nan_to_num(weights, nan=0.0)
         pooled = (weights.unsqueeze(-1) * seq_tokens).sum(dim=1)  # (B, D)
-        return pooled
+
+        top_k_tokens: Optional[torch.Tensor] = None
+        if top_k > 0:
+            actual_k = min(top_k, L)
+            _, topk_idx = score.topk(actual_k, dim=1)               # (B, actual_k)
+            gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, D)
+            top_k_tokens = seq_tokens.gather(1, gather_idx)         # (B, actual_k, D)
+            if actual_k < top_k:
+                pad = top_k_tokens.new_zeros(B, top_k - actual_k, D)
+                top_k_tokens = torch.cat([top_k_tokens, pad], dim=1)
+            # Zero out tokens for fully-padded rows (they have no real positions)
+            all_padded = seq_padding_mask.all(dim=1)               # (B,)
+            if all_padded.any():
+                top_k_tokens = top_k_tokens * (~all_padded).view(B, 1, 1).float()
+
+        return pooled, top_k_tokens
 
 
 class MultiSeqQueryGenerator(nn.Module):
@@ -633,12 +657,14 @@ class MultiSeqQueryGenerator(nn.Module):
         use_din_pool: bool = False,
         din_pos_dim: int = 0,
         din_max_len: int = 1024,
+        din_top_k: int = 0,
     ) -> None:
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.d_model = d_model
         self.use_din_pool = use_din_pool
+        self.din_top_k = din_top_k if use_din_pool else 0
 
         global_info_dim = (num_ns + 1) * d_model
 
@@ -690,9 +716,11 @@ class MultiSeqQueryGenerator(nn.Module):
 
         q_tokens_list = []
         for i in range(self.num_sequences):
+            top_k_tokens = None
             if self.use_din_pool and item_query is not None:
-                seq_pooled = self.din_poolers[i](
-                    item_query, seq_tokens_list[i], seq_padding_masks[i]
+                seq_pooled, top_k_tokens = self.din_poolers[i](
+                    item_query, seq_tokens_list[i], seq_padding_masks[i],
+                    top_k=self.din_top_k,
                 )
             else:
                 valid_mask = ~seq_padding_masks[i]
@@ -705,9 +733,14 @@ class MultiSeqQueryGenerator(nn.Module):
             global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
             global_info = self.global_info_norm(global_info)
 
-            # Generate N query tokens
+            # Generate N FFN-based query tokens
             queries = [ffn(global_info) for ffn in self.query_ffns_per_seq[i]]
-            q_tokens = torch.stack(queries, dim=1)  # (B, Nq, D)
+            q_tokens = torch.stack(queries, dim=1)  # (B, num_queries, D)
+
+            # Append DIN-selected top-K seq tokens as extra "data-driven" queries
+            if top_k_tokens is not None and self.din_top_k > 0:
+                q_tokens = torch.cat([q_tokens, top_k_tokens], dim=1)  # (B, num_queries + top_k, D)
+
             q_tokens_list.append(q_tokens)
 
         return q_tokens_list
@@ -1511,6 +1544,10 @@ class PCVRHyFormer(nn.Module):
         use_din_pool: bool = False,
         din_pos_dim: int = 0,
         din_max_len: int = 1024,
+        # DIN top-K extra queries: K most relevant seq positions per domain become
+        # additional Q tokens (alongside the FFN-generated num_queries) in the
+        # cross-attention + token mixing pipeline. 0 = disabled.
+        din_top_k: int = 0,
         # LONGER-style token merge (compresses each sequence by this factor
         # before downstream attention; 1 = disabled)
         merge_size: int = 1,
@@ -1531,6 +1568,10 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_din_pool = use_din_pool
+        # Effective Q per sequence = FFN-generated num_queries + DIN top-K
+        # (top-K disabled unless DIN is on).
+        self.din_top_k = din_top_k if use_din_pool else 0
+        self.effective_num_queries = num_queries + self.din_top_k
         self.merge_size = merge_size
 
         # ================== NS Tokens Construction ==================
@@ -1604,12 +1645,14 @@ class PCVRHyFormer(nn.Module):
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
-        T = num_queries * self.num_sequences + self.num_ns
+        # T includes DIN top-K queries when enabled (those tokens flow through
+        # cross-attention + token mixing alongside the FFN-generated queries).
+        T = self.effective_num_queries * self.num_sequences + self.num_ns
         if rank_mixer_mode == 'full' and d_model % T != 0:
             valid_T_values = [t for t in range(1, d_model + 1) if d_model % t == 0]
             raise ValueError(
-                f"d_model={d_model} must be divisible by T=num_queries*num_sequences+num_ns="
-                f"{num_queries}*{self.num_sequences}+{self.num_ns}={T}. "
+                f"d_model={d_model} must be divisible by T=(num_queries+din_top_k)*num_sequences+num_ns="
+                f"({num_queries}+{self.din_top_k})*{self.num_sequences}+{self.num_ns}={T}. "
                 f"Valid T values for d_model={d_model}: {valid_T_values}"
             )
 
@@ -1701,6 +1744,7 @@ class PCVRHyFormer(nn.Module):
             use_din_pool=use_din_pool,
             din_pos_dim=din_pos_dim,
             din_max_len=din_max_len,
+            din_top_k=self.din_top_k,
         )
 
         # MultiSeqHyFormerBlock stack
@@ -1708,7 +1752,7 @@ class PCVRHyFormer(nn.Module):
             MultiSeqHyFormerBlock(
                 d_model=d_model,
                 num_heads=num_heads,
-                num_queries=num_queries,
+                num_queries=self.effective_num_queries,  # = num_queries + din_top_k
                 num_ns=self.num_ns,
                 num_sequences=self.num_sequences,
                 seq_encoder_type=seq_encoder_type,
@@ -1728,9 +1772,10 @@ class PCVRHyFormer(nn.Module):
         else:
             self.rotary_emb = None
 
-        # Output projection
+        # Output projection — input width matches effective_num_queries (which
+        # includes DIN top-K queries when enabled).
         self.output_proj = nn.Sequential(
-            nn.Linear(num_queries * self.num_sequences * d_model, d_model),
+            nn.Linear(self.effective_num_queries * self.num_sequences * d_model, d_model),
             nn.LayerNorm(d_model),
         )
 

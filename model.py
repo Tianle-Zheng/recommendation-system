@@ -1261,6 +1261,37 @@ class GroupNSTokenizer(nn.Module):
             tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
         return torch.cat(tokens, dim=1)  # (B, num_groups, D)
 
+    def get_raw_fid_embeddings(self, int_feats: torch.Tensor) -> torch.Tensor:
+        """Return per-fid embeddings stacked along a new token dim.
+
+        Mirrors the embedding lookup in forward(), but stops before group
+        projection. Used by DIN's item_query construction so the aggregator
+        attends to all individual fid embeddings instead of the compressed
+        group tokens.
+
+        Returns:
+            (B, total_num_fids, emb_dim) — total_num_fids = sum(len(g) for g in groups).
+        """
+        all_embs = []
+        for group in self.groups:
+            for fid_idx in group:
+                vs, offset, length = self.feature_specs[fid_idx]
+                emb_real_idx = self._emb_index[fid_idx]
+                if emb_real_idx == -1:
+                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
+                else:
+                    emb_layer = self.embs[emb_real_idx]
+                    if length == 1:
+                        fid_emb = emb_layer(int_feats[:, offset].long())
+                    else:
+                        vals = int_feats[:, offset:offset + length].long()
+                        emb_all = emb_layer(vals)
+                        mask = (vals != 0).float().unsqueeze(-1)
+                        count = mask.sum(dim=1).clamp(min=1)
+                        fid_emb = (emb_all * mask).sum(dim=1) / count
+                all_embs.append(fid_emb)
+        return torch.stack(all_embs, dim=1)
+
 
 class RankMixerNSTokenizer(nn.Module):
     """NS Tokenizer following the RankMixer paper's approach.
@@ -1382,6 +1413,34 @@ class RankMixerNSTokenizer(nn.Module):
             tokens.append(F.silu(proj(chunk)).unsqueeze(1))  # (B, 1, d_model)
 
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
+
+    def get_raw_fid_embeddings(self, int_feats: torch.Tensor) -> torch.Tensor:
+        """Return per-fid embeddings without chunk projection. Used by DIN.
+
+        Returns:
+            (B, total_num_fids, emb_dim) — preserves individual fid identity
+            so the DIN aggregator attends to every fid separately instead of
+            the compressed chunked tokens.
+        """
+        all_embs = []
+        for group in self.groups:
+            for fid_idx in group:
+                vs, offset, length = self.feature_specs[fid_idx]
+                emb_real_idx = self._emb_index[fid_idx]
+                if emb_real_idx == -1:
+                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
+                else:
+                    emb_layer = self.embs[emb_real_idx]
+                    if length == 1:
+                        fid_emb = emb_layer(int_feats[:, offset].long())
+                    else:
+                        vals = int_feats[:, offset:offset + length].long()
+                        emb_all = emb_layer(vals)
+                        mask = (vals != 0).float().unsqueeze(-1)
+                        count = mask.sum(dim=1).clamp(min=1)
+                        fid_emb = (emb_all * mask).sum(dim=1) / count
+                all_embs.append(fid_emb)
+        return torch.stack(all_embs, dim=1)
 
 
 class PCVRHyFormer(nn.Module):
@@ -1592,9 +1651,13 @@ class PCVRHyFormer(nn.Module):
             })
 
         # ================== Item Query Aggregator (for DIN) ==================
-        # Replaces mean pool over item NS tokens + item dense token with a
-        # learned attention aggregation. Active only when use_din_pool=True.
+        # For DIN's item_query, we attend over RAW item fid embeddings (not the
+        # 2 compressed NS tokens) so the aggregator has K=num_item_fids tokens
+        # to weight rather than just 2. Projects emb_dim -> d_model when they
+        # differ. Active only when use_din_pool=True.
         if use_din_pool:
+            if emb_dim != d_model:
+                self.item_raw_proj = nn.Linear(emb_dim, d_model)
             self.item_query_aggregator = ItemQueryAggregator(d_model, num_heads=2)
 
         # ================== Time Interval Bucket Embedding (optional) ==================
@@ -1867,16 +1930,28 @@ class PCVRHyFormer(nn.Module):
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
-        item_tokens_for_query = [item_ns]
+        item_dense_tok = None
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
-            item_tokens_for_query.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
-        item_query = self.item_query_aggregator(
-            torch.cat(item_tokens_for_query, dim=1)
-        ) if self.use_din_pool else None
+
+        # DIN item_query: attend over RAW item fid embeddings (one per fid)
+        # instead of the 2 compressed NS tokens, so the aggregator has real
+        # material to learn from.
+        if self.use_din_pool:
+            item_raw = self.item_ns_tokenizer.get_raw_fid_embeddings(
+                inputs.item_int_feats)  # (B, num_item_fids, emb_dim)
+            if hasattr(self, 'item_raw_proj'):
+                item_raw = self.item_raw_proj(item_raw)  # (B, num_item_fids, D)
+            item_tokens_for_query = [item_raw]
+            if item_dense_tok is not None:
+                item_tokens_for_query.append(item_dense_tok)
+            item_query = self.item_query_aggregator(
+                torch.cat(item_tokens_for_query, dim=1))
+        else:
+            item_query = None
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1922,16 +1997,25 @@ class PCVRHyFormer(nn.Module):
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
-        item_tokens_for_query = [item_ns]
+        item_dense_tok = None
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
-            item_tokens_for_query.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
-        item_query = self.item_query_aggregator(
-            torch.cat(item_tokens_for_query, dim=1)
-        ) if self.use_din_pool else None
+
+        if self.use_din_pool:
+            item_raw = self.item_ns_tokenizer.get_raw_fid_embeddings(
+                inputs.item_int_feats)
+            if hasattr(self, 'item_raw_proj'):
+                item_raw = self.item_raw_proj(item_raw)
+            item_tokens_for_query = [item_raw]
+            if item_dense_tok is not None:
+                item_tokens_for_query.append(item_dense_tok)
+            item_query = self.item_query_aggregator(
+                torch.cat(item_tokens_for_query, dim=1))
+        else:
+            item_query = None
 
         seq_tokens_list = []
         seq_masks_list = []

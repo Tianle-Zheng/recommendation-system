@@ -124,11 +124,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
-                        choices=['full', 'ffn_only', 'none'],
+                        choices=['full', 'ffn_only', 'none', 'moe'],
                         help='RankMixerBlock mode: '
                              'full = token mixing + per-token FFN (requires d_model divisible by T), '
                              'ffn_only = per-token FFN only, '
-                             'none = identity passthrough')
+                             'none = identity passthrough, '
+                             'moe = token mixing + sparse top-k MoE FFN')
+    parser.add_argument('--moe_num_experts', type=int, default=4,
+                        help='Number of expert FFNs (used only when --rank_mixer_mode=moe)')
+    parser.add_argument('--moe_top_k', type=int, default=2,
+                        help='Top-k experts activated per token (used only when --rank_mixer_mode=moe)')
+    parser.add_argument('--moe_aux_loss_weight', type=float, default=0.01,
+                        help='Coefficient for MoE load-balancing auxiliary loss')
     parser.add_argument('--use_din_pool', action='store_true', default=False,
                         help='Replace mean pool in MultiSeqQueryGenerator with DIN-style '
                              'target-aware attention pool (uses item embedding as query)')
@@ -332,6 +339,8 @@ def main() -> None:
                        else (0 if args.din_pos_dim < 0 else args.din_pos_dim),
         "din_max_len": args.din_max_len,
         "din_top_k": args.din_top_k,
+        "moe_num_experts": args.moe_num_experts,
+        "moe_top_k": args.moe_top_k,
         "merge_size": args.merge_size,
         "merge_num_heads": args.merge_num_heads,
     }
@@ -383,6 +392,7 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        moe_aux_loss_weight=args.moe_aux_loss_weight,
     )
 
     trainer.train()

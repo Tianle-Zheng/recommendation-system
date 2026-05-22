@@ -42,12 +42,14 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --num_workers 8 \
 #     "$@"
 
-# ---- Experimental: ALL-IN at d_model=128 (DIN + Merge + RoPE + Top-K) ----
+# ---- Experimental: ALL-IN at d_model=128 (DIN + Merge + RoPE + Top-K + MoE) ----
 # Scales width to 128 and unlocks T=64 budget for DIN top-K queries.
 #   T = (num_queries + din_top_k) * num_sequences + num_ns
 #     = (2 + 12) * 4 + (5+1+2+0) = 64    ✓ 128 % 64 == 0
 # top_k=12 per sequence × 4 ≈ 48 total ~ LONGER paper's "50 sampled queries"
-# sweet spot. Comment everything above and uncomment this to run.
+# sweet spot. MoE replaces shared FFN with sparse top-2 of 4 experts
+# (params 4x, compute ~2x baseline FFN). Comment everything above and
+# uncomment this to run.
 #
 # python3 -u "${SCRIPT_DIR}/train.py" \
 #     --ns_tokenizer_type rankmixer \
@@ -59,5 +61,6 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --merge_size 8 --merge_num_heads 4 \
 #     --use_din_pool --din_pos_dim 0 --din_top_k 12 \
 #     --use_rope \
+#     --rank_mixer_mode moe --moe_num_experts 4 --moe_top_k 2 --moe_aux_loss_weight 0.01 \
 #     --emb_skip_threshold 1000000 --num_workers 8 \
 #     "$@"

@@ -329,31 +329,46 @@ class RankMixerBlock(nn.Module):
         n_total: int,  # T = Nq + Nns
         hidden_mult: int = 4,
         dropout: float = 0.0,
-        mode: str = 'full'  # 'full' | 'ffn_only' | 'none'
+        mode: str = 'full',  # 'full' | 'ffn_only' | 'none' | 'moe'
+        num_experts: int = 4,
+        top_k: int = 2,
     ) -> None:
         super().__init__()
         self.T = n_total
         self.D = d_model
         self.mode = mode
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.last_aux_loss = 0.0  # Updated in forward when mode='moe'
 
         if mode == 'none':
-            # Pure identity mapping, no submodules created
             return
 
-        if mode == 'full':
+        if mode in ('full', 'moe'):
             if d_model % n_total != 0:
                 raise ValueError(
                     f"d_model={d_model} must be divisible by T={n_total} for token mixing."
                 )
             self.d_sub = d_model // n_total
 
-        # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
         self.norm = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
-        self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
         self.dropout = nn.Dropout(dropout)
-        # Post-LN after residual to stabilize stacked block outputs
         self.post_norm = nn.LayerNorm(d_model)
+
+        if mode == 'moe':
+            self.router = nn.Linear(d_model, num_experts, bias=False)
+            self.experts = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(d_model, d_model * hidden_mult),
+                    nn.GELU(),
+                    nn.Linear(d_model * hidden_mult, d_model),
+                )
+                for _ in range(num_experts)
+            ])
+        else:
+            # Per-token FFN (shared parameters) — used by 'full' and 'ffn_only'
+            self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
+            self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
 
     def token_mixing(self, Q: torch.Tensor) -> torch.Tensor:
         """Performs parameter-free token mixing via reshape and transpose.
@@ -393,23 +408,52 @@ class RankMixerBlock(nn.Module):
         if self.mode == 'none':
             return Q
 
-        # Token Mixing (parameter-free rewire) or identity
-        if self.mode == 'full':
+        if self.mode in ('full', 'moe'):
             Q_hat = self.token_mixing(Q)
         else:  # 'ffn_only'
             Q_hat = Q
 
-        # Per-token FFN
         x = self.norm(Q_hat)
-        x = self.fc1(x)
-        x = F.gelu(x)
-        x = self.dropout(x)
-        Q_e = self.fc2(x)
 
-        # Residual from original Q
+        if self.mode == 'moe':
+            Q_e = self._moe_ffn(x)
+        else:
+            x = self.fc1(x)
+            x = F.gelu(x)
+            x = self.dropout(x)
+            Q_e = self.fc2(x)
+
         Q_boost = Q + Q_e
         Q_boost = self.post_norm(Q_boost)
         return Q_boost
+
+    def _moe_ffn(self, x: torch.Tensor) -> torch.Tensor:
+        """Sparse top-k MoE FFN with Switch-Transformer load-balancing aux loss."""
+        B, T, D = x.shape
+        x_flat = x.reshape(B * T, D)
+
+        gate_logits = self.router(x_flat)              # (B*T, E)
+        gates = F.softmax(gate_logits, dim=-1)
+        topk_gates, topk_idx = gates.topk(self.top_k, dim=-1)
+        topk_gates = topk_gates / topk_gates.sum(-1, keepdim=True)
+
+        out = torch.zeros_like(x_flat)
+        for e in range(self.num_experts):
+            mask = (topk_idx == e)
+            if not mask.any():
+                continue
+            tok_idx, k_idx = mask.nonzero(as_tuple=True)
+            expert_out = self.experts[e](x_flat[tok_idx])
+            w = topk_gates[tok_idx, k_idx].unsqueeze(-1)
+            out.index_add_(0, tok_idx, w * expert_out)
+
+        arange_e = torch.arange(self.num_experts, device=x.device)
+        chosen = (topk_idx.unsqueeze(-1) == arange_e).any(dim=1).float()
+        load = chosen.mean(dim=0)
+        importance = gates.mean(dim=0)
+        self.last_aux_loss = self.num_experts * (load * importance).sum()
+
+        return out.view(B, T, D)
 
 
 class LONGERTokenMerge(nn.Module):
@@ -1119,7 +1163,9 @@ class MultiSeqHyFormerBlock(nn.Module):
         dropout: float = 0.0,
         top_k: int = 50,
         causal: bool = False,
-        rank_mixer_mode: str = 'full'
+        rank_mixer_mode: str = 'full',
+        moe_num_experts: int = 4,
+        moe_top_k: int = 2,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
@@ -1158,7 +1204,9 @@ class MultiSeqHyFormerBlock(nn.Module):
             n_total=n_total,
             hidden_mult=hidden_mult,
             dropout=dropout,
-            mode=rank_mixer_mode
+            mode=rank_mixer_mode,
+            num_experts=moe_num_experts,
+            top_k=moe_top_k,
         )
 
     def forward(
@@ -1552,6 +1600,9 @@ class PCVRHyFormer(nn.Module):
         # before downstream attention; 1 = disabled)
         merge_size: int = 1,
         merge_num_heads: int = 2,
+        # MoE config (only used when rank_mixer_mode='moe')
+        moe_num_experts: int = 4,
+        moe_top_k: int = 2,
     ) -> None:
         super().__init__()
 
@@ -1760,6 +1811,8 @@ class PCVRHyFormer(nn.Module):
                 dropout=dropout_rate,
                 top_k=seq_top_k,
                 causal=seq_causal,
+                moe_num_experts=moe_num_experts,
+                moe_top_k=moe_top_k,
                 rank_mixer_mode=rank_mixer_mode,
             )
             for _ in range(num_hyformer_blocks)
@@ -1901,6 +1954,19 @@ class PCVRHyFormer(nn.Module):
         """Returns all non-embedding parameters (optimized with AdamW)."""
         sparse_ptrs = {p.data_ptr() for p in self.get_sparse_params()}
         return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
+
+    def get_aux_loss(self) -> torch.Tensor:
+        """Collects MoE load-balancing aux losses from all blocks.
+
+        Returns a scalar zero tensor when no block is running in 'moe' mode.
+        """
+        device = next(self.parameters()).device
+        total = torch.zeros((), device=device)
+        for block in self.blocks:
+            aux = block.mixer.last_aux_loss
+            if torch.is_tensor(aux):
+                total = total + aux
+        return total
 
     def _embed_seq_domain(
         self,

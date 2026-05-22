@@ -61,6 +61,6 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --merge_size 8 --merge_num_heads 4 \
 #     --use_din_pool --din_pos_dim 0 --din_top_k 12 \
 #     --use_rope \
-#     --rank_mixer_mode moe --moe_num_experts 4 --moe_top_k 2 --moe_aux_loss_weight 0.01 \
+#     --rank_mixer_mode moe --moe_num_experts 16 --moe_top_k 2 --moe_aux_loss_weight 0.005 \
 #     --emb_skip_threshold 1000000 --num_workers 8 \
 #     "$@"

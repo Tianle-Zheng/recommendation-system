@@ -41,3 +41,26 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --emb_skip_threshold 1000000 \
 #     --num_workers 8 \
 #     "$@"
+
+# ---- Experimental: DIN + LONGER token merge + extended sequence length ----
+# Full-stack long-history setup:
+#   - seq_max_lens raised to 1024 for seq_b/seq_d (so users with 1000+ history
+#     are no longer truncated).
+#   - LONGER token merge (size=4, with inner Transformer) compresses each
+#     loaded sequence back to ~256 before downstream attention, so memory
+#     and FLOPs match the 256-baseline.
+#   - DIN pool over merged tokens does target-aware aggregation.
+#
+# python3 -u "${SCRIPT_DIR}/train.py" \
+#     --ns_tokenizer_type rankmixer \
+#     --user_ns_tokens 5 \
+#     --item_ns_tokens 2 \
+#     --num_queries 2 \
+#     --ns_groups_json "" \
+#     --seq_max_lens "seq_a:512,seq_b:1024,seq_c:512,seq_d:1024" \
+#     --merge_size 4 \
+#     --merge_num_heads 2 \
+#     --use_din_pool \
+#     --emb_skip_threshold 1000000 \
+#     --num_workers 8 \
+#     "$@"

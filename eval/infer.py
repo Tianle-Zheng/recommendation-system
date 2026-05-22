@@ -71,6 +71,8 @@ _FALLBACK_MODEL_CFG = {
     'moe_num_experts': 4,
     'moe_top_k': 2,
     'use_din_pool': False,
+    'merge_size': 1,
+    'merge_num_heads': 2,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'

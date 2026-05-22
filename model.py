@@ -412,6 +412,111 @@ class RankMixerBlock(nn.Module):
         return Q_boost
 
 
+class LONGERTokenMerge(nn.Module):
+    """LONGER-style token merging with an inner Transformer.
+
+    Reduces a sequence (B, L, D) to (B, L/k, D) by:
+      1. Reshaping into windows of k adjacent tokens.
+      2. Running a lightweight Transformer (self-attn + FFN) within each
+         window so the k tokens interact before merging.
+      3. Aggregating each window into one token via a learned query that
+         attends to the k processed tokens.
+
+    Lets the model load longer raw histories (e.g. 1024) and compress them
+    to a manageable length (256) before downstream attention / DIN pool,
+    instead of truncating long-history users.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        merge_size: int = 4,
+        num_heads: int = 2,
+        hidden_mult: int = 2,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.k = merge_size
+
+        # Inner Transformer: 1 layer of self-attn + FFN (Pre-LN)
+        self.inner_norm_attn = nn.LayerNorm(d_model)
+        self.inner_attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True,
+        )
+        self.inner_norm_ffn = nn.LayerNorm(d_model)
+        self.inner_ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * hidden_mult),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * hidden_mult, d_model),
+        )
+
+        # Aggregation: a learned query attending to the k processed tokens
+        self.merge_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.agg_norm = nn.LayerNorm(d_model)
+        self.agg_attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Merge adjacent windows of k tokens into one.
+
+        Args:
+            x: (B, L, D) sequence tokens.
+            padding_mask: (B, L), True at padding positions.
+
+        Returns:
+            (merged_tokens, new_padding_mask) of shapes
+            (B, L_new, D) and (B, L_new) where L_new = ceil(L / k).
+        """
+        B, L, D = x.shape
+        pad = (self.k - L % self.k) % self.k
+        if pad > 0:
+            x = F.pad(x, (0, 0, 0, pad))
+            padding_mask = F.pad(padding_mask, (0, pad), value=True)
+        L_new = (L + pad) // self.k
+
+        # Reshape per-window: (B, L_new, k, D) -> (B * L_new, k, D)
+        x = x.view(B, L_new, self.k, D).reshape(B * L_new, self.k, D)
+        mask_w = padding_mask.view(B, L_new, self.k).reshape(B * L_new, self.k)
+
+        # Windows that are fully-padded cause NaNs in attention; mark them
+        # so we can zero them out at the end.
+        all_pad_window = mask_w.all(dim=-1)  # (B * L_new,)
+        if all_pad_window.any():
+            # Temporarily un-mask one slot so attention is well-defined; the
+            # final tokens for these windows are zeroed below.
+            mask_w = mask_w.clone()
+            mask_w[all_pad_window, 0] = False
+
+        # --- Inner Transformer (Pre-LN) ---
+        x_n = self.inner_norm_attn(x)
+        attn_out, _ = self.inner_attn(x_n, x_n, x_n, key_padding_mask=mask_w)
+        x = x + attn_out
+
+        x_n = self.inner_norm_ffn(x)
+        x = x + self.inner_ffn(x_n)
+
+        # --- Aggregate via learned query ---
+        x_n = self.agg_norm(x)
+        q = self.merge_query.expand(B * L_new, -1, -1)
+        merged, _ = self.agg_attn(q, x_n, x_n, key_padding_mask=mask_w)
+        merged = merged.squeeze(1)  # (B * L_new, D)
+
+        # Zero-out fully-padded windows' merged tokens
+        if all_pad_window.any():
+            merged = merged * (~all_pad_window).unsqueeze(-1).float()
+
+        merged = merged.view(B, L_new, D)
+        # New mask: True only if every sub-token in the window was padded
+        new_padding_mask = padding_mask.view(B, L_new, self.k).all(dim=-1)
+        return merged, new_padding_mask
+
+
 class DINPooler(nn.Module):
     """DIN-style target-aware sequence pooling.
 
@@ -1289,6 +1394,10 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         # DIN-style target-aware sequence pooling
         use_din_pool: bool = False,
+        # LONGER-style token merge (compresses each sequence by this factor
+        # before downstream attention; 1 = disabled)
+        merge_size: int = 1,
+        merge_num_heads: int = 2,
     ) -> None:
         super().__init__()
 
@@ -1305,6 +1414,7 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_din_pool = use_din_pool
+        self.merge_size = merge_size
 
         # ================== NS Tokens Construction ==================
 
@@ -1433,6 +1543,21 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(len(vs) * emb_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+
+        # ================== LONGER Token Merge (optional) ==================
+        # Per-domain learnable merge: reduces each seq from L to ceil(L/merge_size)
+        # via an inner Transformer + learned-query aggregation. Disabled when
+        # merge_size == 1.
+        if merge_size > 1:
+            self.token_merges = nn.ModuleDict({
+                domain: LONGERTokenMerge(
+                    d_model=d_model,
+                    merge_size=merge_size,
+                    num_heads=merge_num_heads,
+                    dropout=dropout_rate,
+                )
+                for domain in self.seq_domains
+            })
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
@@ -1726,6 +1851,12 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
+        # 2.5 Optional LONGER-style token merge per domain
+        if self.merge_size > 1:
+            for i, domain in enumerate(self.seq_domains):
+                seq_tokens_list[i], seq_masks_list[i] = self.token_merges[domain](
+                    seq_tokens_list[i], seq_masks_list[i])
+
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(
             ns_tokens, seq_tokens_list, seq_masks_list, item_query=item_query)
@@ -1771,6 +1902,11 @@ class PCVRHyFormer(nn.Module):
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
+
+        if self.merge_size > 1:
+            for i, domain in enumerate(self.seq_domains):
+                seq_tokens_list[i], seq_masks_list[i] = self.token_merges[domain](
+                    seq_tokens_list[i], seq_masks_list[i])
 
         q_tokens_list = self.query_generator(
             ns_tokens, seq_tokens_list, seq_masks_list, item_query=item_query)

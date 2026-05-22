@@ -132,6 +132,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--use_din_pool', action='store_true', default=False,
                         help='Replace mean pool in MultiSeqQueryGenerator with DIN-style '
                              'target-aware attention pool (uses item embedding as query)')
+    parser.add_argument('--merge_size', type=int, default=1,
+                        help='LONGER-style token merge factor per domain (1 = disabled). '
+                             'Merges every k adjacent tokens via an inner Transformer + '
+                             'learned query, reducing L to ceil(L/k) before downstream blocks. '
+                             'Set --seq_max_lens larger to actually access more history.')
+    parser.add_argument('--merge_num_heads', type=int, default=2,
+                        help='Number of attention heads inside LONGERTokenMerge '
+                             '(used only when --merge_size > 1)')
     parser.add_argument('--use_rope', action='store_true', default=False,
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
@@ -305,6 +313,8 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "use_din_pool": args.use_din_pool,
+        "merge_size": args.merge_size,
+        "merge_num_heads": args.merge_num_heads,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

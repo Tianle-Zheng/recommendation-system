@@ -522,6 +522,25 @@ class LONGERTokenMerge(nn.Module):
         return merged, new_padding_mask
 
 
+class ItemQueryAggregator(nn.Module):
+    """Aggregate K item tokens into (B, D) via learned attention (eval path)."""
+
+    def __init__(self, d_model: int, num_heads: int = 2, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True,
+        )
+
+    def forward(self, item_tokens: torch.Tensor) -> torch.Tensor:
+        B = item_tokens.size(0)
+        q = self.query.expand(B, -1, -1)
+        kv = self.norm(item_tokens)
+        agg, _ = self.attn(q, kv, kv)
+        return agg.squeeze(1)
+
+
 class DINPooler(nn.Module):
     """DIN-style target-aware sequence pooling (eval path).
 
@@ -1550,6 +1569,10 @@ class PCVRHyFormer(nn.Module):
                 for domain in self.seq_domains
             })
 
+        # ================== Item Query Aggregator (for DIN) ==================
+        if use_din_pool:
+            self.item_query_aggregator = ItemQueryAggregator(d_model, num_heads=2)
+
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
@@ -1829,7 +1852,9 @@ class PCVRHyFormer(nn.Module):
             item_tokens_for_query.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
-        item_query = torch.cat(item_tokens_for_query, dim=1).mean(dim=1) if self.use_din_pool else None
+        item_query = self.item_query_aggregator(
+            torch.cat(item_tokens_for_query, dim=1)
+        ) if self.use_din_pool else None
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1881,7 +1906,9 @@ class PCVRHyFormer(nn.Module):
             item_tokens_for_query.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
-        item_query = torch.cat(item_tokens_for_query, dim=1).mean(dim=1) if self.use_din_pool else None
+        item_query = self.item_query_aggregator(
+            torch.cat(item_tokens_for_query, dim=1)
+        ) if self.use_din_pool else None
 
         seq_tokens_list = []
         seq_masks_list = []

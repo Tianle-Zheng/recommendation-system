@@ -517,6 +517,38 @@ class LONGERTokenMerge(nn.Module):
         return merged, new_padding_mask
 
 
+class ItemQueryAggregator(nn.Module):
+    """Aggregate K item tokens (item NS tokens + optional item dense token)
+    into a single (B, D) query vector via learned attention.
+
+    Replaces the simple mean pool that loses per-token semantic distinctions.
+    A single learnable query token attends to all K item tokens; the output
+    is the attention-weighted sum, projected back to D.
+    """
+
+    def __init__(self, d_model: int, num_heads: int = 2, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True,
+        )
+
+    def forward(self, item_tokens: torch.Tensor) -> torch.Tensor:
+        """Args:
+            item_tokens: (B, K, D), concatenation of item NS tokens and item
+                dense token (when present).
+
+        Returns:
+            (B, D) aggregated item query.
+        """
+        B = item_tokens.size(0)
+        q = self.query.expand(B, -1, -1)            # (B, 1, D)
+        kv = self.norm(item_tokens)                 # Pre-LN on K/V
+        agg, _ = self.attn(q, kv, kv)               # (B, 1, D)
+        return agg.squeeze(1)                        # (B, D)
+
+
 class DINPooler(nn.Module):
     """DIN-style target-aware sequence pooling.
 
@@ -1559,6 +1591,12 @@ class PCVRHyFormer(nn.Module):
                 for domain in self.seq_domains
             })
 
+        # ================== Item Query Aggregator (for DIN) ==================
+        # Replaces mean pool over item NS tokens + item dense token with a
+        # learned attention aggregation. Active only when use_din_pool=True.
+        if use_din_pool:
+            self.item_query_aggregator = ItemQueryAggregator(d_model, num_heads=2)
+
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
@@ -1836,7 +1874,9 @@ class PCVRHyFormer(nn.Module):
             item_tokens_for_query.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
-        item_query = torch.cat(item_tokens_for_query, dim=1).mean(dim=1) if self.use_din_pool else None
+        item_query = self.item_query_aggregator(
+            torch.cat(item_tokens_for_query, dim=1)
+        ) if self.use_din_pool else None
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1889,7 +1929,9 @@ class PCVRHyFormer(nn.Module):
             item_tokens_for_query.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
-        item_query = torch.cat(item_tokens_for_query, dim=1).mean(dim=1) if self.use_din_pool else None
+        item_query = self.item_query_aggregator(
+            torch.cat(item_tokens_for_query, dim=1)
+        ) if self.use_din_pool else None
 
         seq_tokens_list = []
         seq_masks_list = []
